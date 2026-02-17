@@ -1,0 +1,48 @@
+# Sentinel Policy: Require Tags
+# This policy ensures all resources have mandatory tags
+
+import "tfplan/v2" as tfplan
+
+# List of mandatory tags
+mandatory_tags = ["Environment", "Owner", "Project", "ManagedBy"]
+
+# Get all resources from the plan
+get_all_resources = func() {
+  resources = []
+  for tfplan.resource_changes as address, rc {
+    # Only check managed resources that are being created or updated
+    if rc.mode == "managed" and (rc.change.actions contains "create" or rc.change.actions contains "update") {
+      append(resources, {"address": address, "resource": rc})
+    }
+  }
+  return resources
+}
+
+# Check if a resource has all required tags
+resource_has_required_tags = func(resource_address, tags) {
+  missing_tags = []
+  
+  for mandatory_tags as tag {
+    if tag not in keys(tags) {
+      append(missing_tags, tag)
+    }
+  }
+  
+  if length(missing_tags) > 0 {
+    print("❌", resource_address, "is missing tags:", missing_tags)
+    return false
+  }
+  
+  print("✓", resource_address, "has all required tags")
+  return true
+}
+
+# Main rule
+main = rule {
+  all get_all_resources() as _, item {
+    resource_has_required_tags(
+      item.address,
+      item.resource.change.after.tags else {}
+    )
+  }
+}

@@ -1,0 +1,84 @@
+# Sentinel Policy: Naming Convention
+# Enforces Azure resource naming standards
+
+import "tfplan/v2" as tfplan
+import "strings"
+
+# Resource type to prefix mapping
+resource_prefixes = {
+  "azurerm_resource_group":              "rg-",
+  "azurerm_storage_account":             "st",  # No dash, must be alphanumeric
+  "azurerm_container_app":               "ca-",
+  "azurerm_container_app_environment":   "cae-",
+  "azurerm_log_analytics_workspace":     "log-",
+  "azurerm_application_insights":        "appi-",
+  "azurerm_container_registry":          "acr",
+}
+
+# Valid environments that should appear in resource names
+valid_environments = ["dev", "staging", "prod", "test", "initial"]
+
+# Get all managed resources being created or updated
+get_resources = func() {
+  resources = []
+  for tfplan.resource_changes as address, rc {
+    if rc.mode == "managed" and (rc.change.actions contains "create" or rc.change.actions contains "update") {
+      append(resources, {"address": address, "type": rc.type, "name": rc.change.after.name})
+    }
+  }
+  return resources
+}
+
+# Validate resource naming
+validate_naming = func(resource) {
+  type = resource.type
+  name = resource.name
+  address = resource.address
+  
+  # Skip resources without naming rules
+  if type not in keys(resource_prefixes) {
+    return true
+  }
+  
+  prefix = resource_prefixes[type]
+  
+  # Check 1: Resource must start with correct prefix
+  if not strings.has_prefix(name, prefix) {
+    print("❌", address, "- Name must start with '" + prefix + "'. Got:", name)
+    return false
+  }
+  
+  # Check 2: Must contain environment (for resources with dashes)
+  if strings.contains(prefix, "-") {
+    has_env = false
+    for valid_environments as env {
+      if strings.contains(name, "-" + env + "-") or strings.has_suffix(name, "-" + env) {
+        has_env = true
+        break
+      }
+    }
+    
+    if not has_env {
+      print("❌", address, "- Name must include environment (dev/staging/prod/test). Got:", name)
+      return false
+    }
+  }
+  
+  # Check 3: Must be lowercase (except storage accounts which are already lowercase)
+  if type != "azurerm_storage_account" {
+    if name != strings.to_lower(name) {
+      print("❌", address, "- Name must be lowercase. Got:", name)
+      return false
+    }
+  }
+  
+  print("✓", address, "- Naming convention valid:", name)
+  return true
+}
+
+# Main rule
+main = rule {
+  all get_resources() as _, resource {
+    validate_naming(resource)
+  }
+}
