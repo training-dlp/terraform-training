@@ -1,6 +1,6 @@
-# 🏗️ Terraform Best Practices
+# 🏗️ Terraform Best Practices (Azure)
 
-A comprehensive guide to writing production-grade Terraform code — with real-world examples for each practice.
+A comprehensive guide to writing production-grade Terraform code on **Microsoft Azure** — with real-world examples for each practice.
 
 ---
 
@@ -31,38 +31,60 @@ A comprehensive guide to writing production-grade Terraform code — with real-w
 
 ## 1. Use Remote State
 
-Storing state locally is risky and makes collaboration impossible. Use a remote backend to share state across teams, enable state locking, and protect against data loss.
+Storing state locally is risky and makes collaboration impossible. Use **Azure Blob Storage** as a remote backend to share state across teams, enable state locking, and protect against data loss.
 
 **Why it matters:**
-- Enables team collaboration
-- Prevents concurrent state corruption via locking
+- Enables team collaboration with a single source of truth
+- Prevents concurrent state corruption via Azure Blob lease-based locking (built-in — no extra resource needed)
 - Keeps sensitive state output off local disks
 
 ```hcl
-# backend.tf — S3 remote backend with DynamoDB locking
+# backend.tf — Azure Blob Storage remote backend
 terraform {
-  backend "s3" {
-    bucket         = "my-company-terraform-state"
-    key            = "prod/networking/terraform.tfstate"
-    region         = "us-east-1"
-    encrypt        = true
-    dynamodb_table = "terraform-state-lock"
+  backend "azurerm" {
+    resource_group_name  = "rg-terraform-state"
+    storage_account_name = "stmycomptfstate"
+    container_name       = "tfstate"
+    key                  = "prod/networking/terraform.tfstate"
   }
 }
 ```
 
 ```hcl
-# Create the DynamoDB lock table (one-time setup)
-resource "aws_dynamodb_table" "terraform_lock" {
-  name         = "terraform-state-lock"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID"
+# bootstrap/main.tf — one-time setup of the remote state infrastructure
+resource "azurerm_resource_group" "tfstate" {
+  name     = "rg-terraform-state"
+  location = "uksouth"
+}
 
-  attribute {
-    name = "LockID"
-    type = "S"
+resource "azurerm_storage_account" "tfstate" {
+  name                            = "stmycomptfstate"
+  resource_group_name             = azurerm_resource_group.tfstate.name
+  location                        = azurerm_resource_group.tfstate.location
+  account_tier                    = "Standard"
+  account_replication_type        = "GRS"       # Geo-redundant for durability
+  allow_nested_items_to_be_public = false
+  min_tls_version                 = "TLS1_2"
+
+  blob_properties {
+    versioning_enabled = true  # Recover from accidental state deletion
   }
 }
+
+resource "azurerm_storage_container" "tfstate" {
+  name                  = "tfstate"
+  storage_account_name  = azurerm_storage_account.tfstate.name
+  container_access_type = "private"
+}
+```
+
+```bash
+# Initialise with backend config passed at runtime (keeps secrets out of code)
+terraform init \
+  -backend-config="storage_account_name=stmycomptfstate" \
+  -backend-config="container_name=tfstate" \
+  -backend-config="key=prod/networking/terraform.tfstate" \
+  -backend-config="resource_group_name=rg-terraform-state"
 ```
 
 > 💡 **Tip:** Use separate state files per environment (`dev/`, `staging/`, `prod/`) and per component (`networking/`, `compute/`, `database/`) to limit blast radius.
@@ -71,7 +93,7 @@ resource "aws_dynamodb_table" "terraform_lock" {
 
 ## 2. Use Existing Shared and Community Modules
 
-Don't reinvent the wheel. The [Terraform Registry](https://registry.terraform.io/) has thousands of vetted, well-maintained modules for AWS, Azure, GCP, and more.
+Don't reinvent the wheel. The [Terraform Registry](https://registry.terraform.io/) has thousands of vetted, well-maintained modules for Azure.
 
 **Why it matters:**
 - Faster delivery — skip boilerplate
@@ -79,25 +101,42 @@ Don't reinvent the wheel. The [Terraform Registry](https://registry.terraform.io
 - Regular security and feature updates
 
 ```hcl
-# Use the official AWS VPC module instead of writing it from scratch
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
+# Use the community Azure Virtual Network module
+module "vnet" {
+  source  = "Azure/vnet/azurerm"
+  version = "~> 4.0"
 
-  name = "my-production-vpc"
-  cidr = "10.0.0.0/16"
+  resource_group_name = azurerm_resource_group.main.name
+  vnet_location       = azurerm_resource_group.main.location
+  vnet_name           = "vnet-myco-prod-uks"
+  address_space       = ["10.0.0.0/16"]
 
-  azs             = ["us-east-1a", "us-east-1b", "us-east-1c"]
-  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+  subnet_names    = ["snet-web", "snet-app", "snet-data"]
+  subnet_prefixes = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
 
-  enable_nat_gateway = true
-  single_nat_gateway = false
+  tags = local.common_tags
+}
+```
 
-  tags = {
-    Environment = "production"
-    Team        = "platform"
+```hcl
+# Use the community AKS module
+module "aks" {
+  source  = "Azure/aks/azurerm"
+  version = "~> 8.0"
+
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  cluster_name        = "aks-myco-prod-uks"
+  kubernetes_version  = "1.29"
+
+  node_pools = {
+    system = {
+      vm_size    = "Standard_D2s_v3"
+      node_count = 3
+    }
   }
+
+  tags = local.common_tags
 }
 ```
 
@@ -107,7 +146,7 @@ module "vpc" {
 
 ## 3. Import Existing Infrastructure
 
-Already have cloud resources not managed by Terraform? Use `terraform import` (or the `import` block in Terraform 1.5+) to bring them under IaC management.
+Already have Azure resources not managed by Terraform? Use `terraform import` (or the `import` block in Terraform 1.5+) to bring them under IaC management.
 
 **Why it matters:**
 - Avoids resource recreation or drift
@@ -117,21 +156,42 @@ Already have cloud resources not managed by Terraform? Use `terraform import` (o
 ```hcl
 # Terraform 1.5+ — declarative import block
 import {
-  to = aws_s3_bucket.existing_logs
-  id = "my-existing-log-bucket-name"
+  to = azurerm_resource_group.existing
+  id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-existing-app"
 }
 
-resource "aws_s3_bucket" "existing_logs" {
-  bucket = "my-existing-log-bucket-name"
+resource "azurerm_resource_group" "existing" {
+  name     = "rg-existing-app"
+  location = "uksouth"
+}
+```
+
+```hcl
+# Import an existing Storage Account
+import {
+  to = azurerm_storage_account.existing_logs
+  id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-logs/providers/Microsoft.Storage/storageAccounts/stmycomplogsprod"
+}
+
+resource "azurerm_storage_account" "existing_logs" {
+  name                     = "stmycomplogsprod"
+  resource_group_name      = "rg-logs"
+  location                 = "uksouth"
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
 }
 ```
 
 ```bash
 # Classic CLI import (Terraform < 1.5)
-terraform import aws_s3_bucket.existing_logs my-existing-log-bucket-name
+terraform import azurerm_resource_group.existing \
+  /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-existing-app
 
 # Generate config from an existing resource (Terraform 1.5+)
 terraform plan -generate-config-out=generated.tf
+
+# Use aztfexport to bulk-export an entire resource group
+aztfexport resource-group rg-existing-app
 ```
 
 > 💡 **Tip:** After importing, always run `terraform plan` to confirm zero drift before committing the state.
@@ -149,43 +209,57 @@ Hardcoded values make code brittle, non-reusable, and difficult to promote acros
 
 ```hcl
 # ❌ Bad — hardcoded values scattered in resources
-resource "aws_instance" "web" {
-  ami           = "ami-0c55b159cbfafe1f0"
-  instance_type = "t3.medium"
-  subnet_id     = "subnet-abc123"
+resource "azurerm_linux_virtual_machine" "web" {
+  name                = "vm-web-prod"
+  resource_group_name = "rg-prod-app"
+  location            = "uksouth"
+  size                = "Standard_D2s_v3"
+  admin_username      = "adminuser"
 }
 ```
 
 ```hcl
-# ✅ Good — variables with descriptions and types
-variable "ami_id" {
-  description = "AMI ID for the EC2 instance"
+# ✅ Good — parameterised with typed variables
+variable "vm_size" {
+  description = "Azure VM SKU size"
+  type        = string
+  default     = "Standard_B2s"
+}
+
+variable "location" {
+  description = "Azure region for all resources"
+  type        = string
+  default     = "uksouth"
+}
+
+variable "resource_group_name" {
+  description = "Name of the resource group"
   type        = string
 }
 
-variable "instance_type" {
-  description = "EC2 instance type"
+variable "admin_username" {
+  description = "Admin username for the VM"
   type        = string
-  default     = "t3.micro"
+  default     = "azureadmin"
 }
 
-variable "subnet_id" {
-  description = "Subnet ID to launch the instance in"
-  type        = string
-}
+resource "azurerm_linux_virtual_machine" "web" {
+  name                = "${local.prefix}-vm-web"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  size                = var.vm_size
+  admin_username      = var.admin_username
 
-resource "aws_instance" "web" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
-  subnet_id     = var.subnet_id
+  # ... other required blocks
 }
 ```
 
 ```hcl
 # prod.tfvars
-ami_id        = "ami-0c55b159cbfafe1f0"
-instance_type = "t3.large"
-subnet_id     = "subnet-prod-001"
+location            = "uksouth"
+resource_group_name = "rg-myco-prod-app"
+vm_size             = "Standard_D4s_v3"
+admin_username      = "azureadmin"
 ```
 
 ```bash
@@ -218,14 +292,36 @@ terraform fmt -recursive && terraform validate && terraform plan
 ```
 
 ```yaml
-# .github/workflows/terraform.yml — CI pipeline snippet
-- name: Terraform Format Check
-  run: terraform fmt -check -recursive
+# .github/workflows/terraform.yml — CI pipeline for Azure
+name: Terraform CI
 
-- name: Terraform Validate
-  run: |
-    terraform init -backend=false
-    terraform validate
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
 ```
 
 > 💡 **Tip:** Add a pre-commit hook using [`pre-commit`](https://pre-commit.com/) with `terraform_fmt` and `terraform_validate` hooks so formatting is enforced locally before any commit.
@@ -234,41 +330,66 @@ terraform fmt -recursive && terraform validate && terraform plan
 
 ## 6. Use a Consistent Naming Convention
 
-Resource names should be predictable and encode context. Adopt a convention and apply it everywhere.
+Resource names should be predictable and encode context. Azure has specific naming constraints (length limits, allowed characters per resource type) — plan your convention accordingly.
 
 **Why it matters:**
-- Makes resources easily discoverable in the console
+- Makes resources easily discoverable in the Azure Portal
 - Avoids naming collisions across environments
 - Communicates ownership and purpose at a glance
 
 ```hcl
-# Recommended pattern: {org}-{env}-{region}-{component}-{suffix}
+# Azure CAF recommended pattern: {resource-type}-{workload}-{env}-{region}-{instance}
+# Reference: https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/ready/azure-best-practices/resource-naming
+
 locals {
-  prefix = "${var.org}-${var.environment}-${var.region}"
+  prefix = "${var.org}-${var.environment}-${var.short_location}"
+  # e.g. myco-prod-uks
 }
 
-resource "aws_s3_bucket" "app_logs" {
-  bucket = "${local.prefix}-app-logs"
-  # e.g. myco-prod-use1-app-logs
+# Resource Group
+resource "azurerm_resource_group" "app" {
+  name     = "rg-${local.prefix}-app"          # rg-myco-prod-uks-app
+  location = var.location
 }
 
-resource "aws_security_group" "web" {
-  name        = "${local.prefix}-web-sg"
-  description = "Security group for web tier"
-  vpc_id      = module.vpc.vpc_id
-  # e.g. myco-prod-use1-web-sg
+# Virtual Network
+resource "azurerm_virtual_network" "main" {
+  name                = "vnet-${local.prefix}"  # vnet-myco-prod-uks
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  address_space       = ["10.0.0.0/16"]
 }
 
-resource "aws_db_instance" "main" {
-  identifier = "${local.prefix}-postgres-main"
-  # e.g. myco-prod-use1-postgres-main
+# Storage Account — max 24 chars, lowercase alphanumeric only — no hyphens!
+resource "azurerm_storage_account" "logs" {
+  name                     = "st${var.org}${var.environment}logs"  # stmycoprodlogs
+  resource_group_name      = azurerm_resource_group.app.name
+  location                 = azurerm_resource_group.app.location
+  account_tier             = "Standard"
+  account_replication_type = "GRS"
+}
+
+# Key Vault — max 24 chars
+resource "azurerm_key_vault" "main" {
+  name                = "kv-${local.prefix}"    # kv-myco-prod-uks
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  tenant_id           = data.azurerm_client_config.current.tenant_id
+  sku_name            = "standard"
+}
+
+# Network Security Group
+resource "azurerm_network_security_group" "web" {
+  name                = "nsg-${local.prefix}-web"  # nsg-myco-prod-uks-web
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
 }
 ```
 
 ```hcl
 # variables.tf
 variable "org" {
-  description = "Organisation short name"
+  description = "Organisation short name (lowercase, no hyphens)"
   type        = string
   default     = "myco"
 }
@@ -278,31 +399,37 @@ variable "environment" {
   type        = string
 }
 
-variable "region" {
-  description = "Short AWS region code"
+variable "location" {
+  description = "Azure region"
   type        = string
-  default     = "use1"
+  default     = "uksouth"
+}
+
+variable "short_location" {
+  description = "Short location code for naming (e.g. uks, euw, eus)"
+  type        = string
+  default     = "uks"
 }
 ```
 
-> 💡 **Tip:** Document your naming convention in a `CONVENTIONS.md` in your repo root so new team members onboard quickly.
+> 💡 **Tip:** Refer to the [Azure Naming Tool](https://github.com/mspnp/AzureNamingTool) for CAF-compliant naming generation and document your convention in a `CONVENTIONS.md` in your repo root.
 
 ---
 
 ## 7. Tag Your Resources
 
-Tags are your best friend for cost allocation, security auditing, and operational visibility. Enforce them via locals and policy.
+Tags are your best friend for cost allocation, security auditing, and operational visibility. Use `merge()` with a central `locals` block so every resource inherits the baseline.
 
 **Why it matters:**
-- Cost visibility by team, project, or environment
-- Enables automated governance and compliance checks
+- Cost visibility by team, project, or environment in Azure Cost Management
+- Enables automated governance via Azure Policy
 - Simplifies incident response — who owns this resource?
 
 ```hcl
 # locals.tf — centralised tag definition
 locals {
   common_tags = {
-    Organization = "MyCompany"
+    Organisation = "MyCompany"
     Environment  = var.environment
     Team         = var.team
     Project      = var.project
@@ -313,81 +440,118 @@ locals {
 }
 
 # Merge common tags with resource-specific tags
-resource "aws_instance" "web" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
+resource "azurerm_linux_virtual_machine" "web" {
+  name                = "${local.prefix}-vm-web"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  size                = var.vm_size
+  admin_username      = var.admin_username
 
   tags = merge(local.common_tags, {
-    Name = "${local.prefix}-web-server"
-    Role = "web"
+    Role        = "web"
+    Application = "frontend"
+  })
+
+  # ... other required blocks
+}
+
+resource "azurerm_storage_account" "data" {
+  name                     = "st${var.org}${var.environment}data"
+  resource_group_name      = azurerm_resource_group.app.name
+  location                 = azurerm_resource_group.app.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+
+  tags = merge(local.common_tags, {
+    DataClassification = "Confidential"
+    Backup             = "required"
   })
 }
 
-resource "aws_s3_bucket" "data" {
-  bucket = "${local.prefix}-data"
+resource "azurerm_resource_group" "app" {
+  name     = "rg-${local.prefix}-app"
+  location = var.location
 
-  tags = merge(local.common_tags, {
-    Name        = "${local.prefix}-data"
-    DataClass   = "confidential"
-  })
+  tags = local.common_tags  # RG tags don't auto-inherit to child resources in Azure
 }
 ```
 
-> 💡 **Tip:** Use AWS Tag Policies or Azure Policy to enforce required tags at the cloud level as a safety net.
+> 💡 **Tip:** Use [Azure Policy](https://learn.microsoft.com/en-us/azure/governance/policy/overview) with `Deny` or `Append` effects to enforce required tags at the subscription level as a safety net alongside Terraform tagging.
 
 ---
 
 ## 8. Introduce Policy as Code
 
-Use tools like [OPA](https://www.openpolicyagent.org/) or [Sentinel](https://docs.hashicorp.com/sentinel) to enforce guardrails — before `apply` ever runs.
+Use tools like [OPA / Conftest](https://www.conftest.dev/) or [Checkov](https://www.checkov.io/) to enforce guardrails — before `apply` ever runs.
 
 **Why it matters:**
 - Prevents non-compliant infrastructure from being created
 - Decouples policy from application code
 - Auditable, version-controlled rules
 
-```hcl
-# Using Checkov for static analysis (free, open source)
+```bash
+# Checkov — free, open source static analysis with Azure built-in rules
 # Install: pip install checkov
-# Run:     checkov -d .
+checkov -d . --framework terraform
 ```
 
-```python
+```yaml
 # .checkov.yaml — skip specific checks with justification
 skip-check:
-  - CKV_AWS_20   # S3 bucket is intentionally public (CDN origin)
-```
-
-```bash
-# Run Conftest with OPA policies
-# Install: brew install conftest
-conftest test plan.json --policy ./policies/
-
-# Example OPA policy: deny unencrypted S3 buckets
-# policies/s3.rego
+  - CKV_AZURE_35  # Storage public access intentionally allowed for CDN origin
 ```
 
 ```rego
-# policies/s3.rego
+# policies/azure_storage.rego — OPA policy enforced via Conftest
 package main
 
+# Deny storage accounts without HTTPS-only enforcement
 deny[msg] {
   resource := input.resource_changes[_]
-  resource.type == "aws_s3_bucket"
-  not resource.change.after.server_side_encryption_configuration
-  msg := sprintf("S3 bucket '%s' must have server-side encryption enabled", [resource.address])
+  resource.type == "azurerm_storage_account"
+  not resource.change.after.enable_https_traffic_only
+  msg := sprintf(
+    "Storage account '%s' must enforce HTTPS-only traffic",
+    [resource.address]
+  )
 }
 
+# Deny storage accounts with public blob access enabled
 deny[msg] {
   resource := input.resource_changes[_]
-  resource.type == "aws_s3_bucket"
-  resource.change.after.acl == "public-read"
-  msg := sprintf("S3 bucket '%s' must not be publicly readable", [resource.address])
+  resource.type == "azurerm_storage_account"
+  resource.change.after.allow_nested_items_to_be_public == true
+  msg := sprintf(
+    "Storage account '%s' must not allow public blob access",
+    [resource.address]
+  )
+}
+
+# Deny Key Vaults without soft delete
+deny[msg] {
+  resource := input.resource_changes[_]
+  resource.type == "azurerm_key_vault"
+  resource.change.after.soft_delete_retention_days < 7
+  msg := sprintf(
+    "Key Vault '%s' must have soft delete retention of at least 7 days",
+    [resource.address]
+  )
+}
+
+# Deny VMs without managed disks
+deny[msg] {
+  resource := input.resource_changes[_]
+  resource.type == "azurerm_linux_virtual_machine"
+  resource.change.after.os_disk[_].storage_account_type == ""
+  msg := sprintf(
+    "VM '%s' must use managed disks",
+    [resource.address]
+  )
 }
 ```
 
 ```yaml
-# CI integration
+# .github/workflows/terraform.yml — policy gates in CI
 - name: Generate Terraform Plan JSON
   run: terraform show -json tfplan > plan.json
 
@@ -395,57 +559,80 @@ deny[msg] {
   run: conftest test plan.json --policy ./policies/
 
 - name: Run Checkov Security Scan
-  run: checkov -d . --framework terraform
+  run: checkov -d . --framework terraform --output cli --output junitxml --output-file-path console,checkov-report.xml
 ```
 
 ---
 
 ## 9. Implement a Secrets Management Strategy
 
-Never store secrets in `.tf` files, `.tfvars`, or state files. Retrieve them dynamically at runtime.
+Never store secrets in `.tf` files, `.tfvars`, or state files. Use **Azure Key Vault** to retrieve secrets dynamically at runtime.
 
 **Why it matters:**
 - Secrets in state or code = a breach waiting to happen
 - Dynamic retrieval means no secret rotation needed in code
-- Aligns with zero-trust security principles
+- Aligns with zero-trust and Azure security best practices
 
 ```hcl
-# ✅ Read secrets from AWS Secrets Manager at runtime
-data "aws_secretsmanager_secret_version" "db_password" {
-  secret_id = "prod/myapp/db-password"
-}
-
-resource "aws_db_instance" "main" {
-  engine         = "postgres"
-  instance_class = "db.t3.medium"
-  username       = "admin"
-  password       = data.aws_secretsmanager_secret_version.db_password.secret_string
-  # Secret is retrieved dynamically — never stored in code
+# provider.tf — authenticate via environment variables or Managed Identity
+# Never put credentials directly in .tf files!
+provider "azurerm" {
+  features {}
+  # Uses env vars: ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_SUBSCRIPTION_ID, ARM_TENANT_ID
+  # Or automatically uses Managed Identity when running inside Azure (e.g. Azure DevOps, ACI)
 }
 ```
 
 ```hcl
-# ✅ Use environment variables for provider credentials
-# Never put AWS keys in .tf files!
-# Set via: export AWS_ACCESS_KEY_ID=...
-#          export AWS_SECRET_ACCESS_KEY=...
-#          export AWS_SESSION_TOKEN=...
+# secrets.tf — fetch secrets from Azure Key Vault at runtime
+data "azurerm_client_config" "current" {}
 
-provider "aws" {
-  region = var.aws_region
-  # Credentials sourced from environment or IAM role automatically
+data "azurerm_key_vault" "main" {
+  name                = "kv-myco-prod-uks"
+  resource_group_name = "rg-myco-prod-uks-shared"
+}
+
+data "azurerm_key_vault_secret" "db_password" {
+  name         = "db-admin-password"
+  key_vault_id = data.azurerm_key_vault.main.id
+}
+
+# Use the secret without ever hardcoding it
+resource "azurerm_mssql_server" "main" {
+  name                         = "sql-${local.prefix}"
+  resource_group_name          = azurerm_resource_group.app.name
+  location                     = azurerm_resource_group.app.location
+  version                      = "12.0"
+  administrator_login          = "sqladmin"
+  administrator_login_password = data.azurerm_key_vault_secret.db_password.value
+  minimum_tls_version          = "1.2"
 }
 ```
 
 ```hcl
-# ✅ Mark sensitive outputs — prevents them appearing in logs
+# Best practice — use Managed Identity so apps don't need passwords at all
+resource "azurerm_user_assigned_identity" "app" {
+  name                = "id-${local.prefix}-app"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+}
+
+resource "azurerm_key_vault_access_policy" "app" {
+  key_vault_id = data.azurerm_key_vault.main.id
+  tenant_id    = data.azurerm_client_config.current.tenant_id
+  object_id    = azurerm_user_assigned_identity.app.principal_id
+
+  secret_permissions = ["Get", "List"]
+}
+
+# Mark sensitive outputs to prevent them appearing in logs
 output "db_connection_string" {
-  value     = "postgresql://admin:${data.aws_secretsmanager_secret_version.db_password.secret_string}@${aws_db_instance.main.endpoint}/mydb"
+  value     = "Server=${azurerm_mssql_server.main.fully_qualified_domain_name};Database=mydb"
   sensitive = true
 }
 ```
 
-> ⚠️ **Warning:** Even with `sensitive = true`, the value is still stored in plain text in the state file. Always encrypt your remote state.
+> ⚠️ **Warning:** Even with `sensitive = true`, values are stored in plain text in the state file. Azure Blob Storage encrypts state at rest by default — use Customer-Managed Keys (CMK) for higher compliance requirements.
 
 ---
 
@@ -455,63 +642,81 @@ Treat infrastructure code like application code — write tests.
 
 **Why it matters:**
 - Catch regressions before they hit production
-- Validate module behaviour with real cloud resources
+- Validate module behaviour with real Azure resources
 - Build confidence for refactoring
 
 ```hcl
-# native Terraform test (terraform test) — terraform 1.6+
-# tests/s3_bucket.tftest.hcl
+# Native Terraform test (terraform test) — Terraform 1.6+
+# tests/storage_account.tftest.hcl
 
 variables {
-  environment = "test"
-  bucket_name = "my-test-bucket-12345"
+  environment         = "test"
+  location            = "uksouth"
+  resource_group_name = "rg-tftest-storage"
+  org                 = "myco"
 }
 
-run "s3_bucket_is_private" {
+run "storage_account_is_secure" {
   command = plan
 
   assert {
-    condition     = aws_s3_bucket_public_access_block.main.block_public_acls == true
-    error_message = "S3 bucket must block public ACLs"
+    condition     = azurerm_storage_account.main.enable_https_traffic_only == true
+    error_message = "Storage account must enforce HTTPS-only traffic"
   }
 
   assert {
-    condition     = aws_s3_bucket_server_side_encryption_configuration.main != null
-    error_message = "S3 bucket must have encryption enabled"
+    condition     = azurerm_storage_account.main.allow_nested_items_to_be_public == false
+    error_message = "Storage account must not allow public blob access"
+  }
+
+  assert {
+    condition     = azurerm_storage_account.main.min_tls_version == "TLS1_2"
+    error_message = "Storage account must enforce TLS 1.2 minimum"
+  }
+}
+
+run "storage_account_is_created" {
+  command = apply
+
+  assert {
+    condition     = azurerm_storage_account.main.id != ""
+    error_message = "Storage account was not created"
   }
 }
 ```
 
 ```go
-// Terratest example — tests/s3_test.go
+// Terratest example — tests/storage_account_test.go
 package test
 
 import (
+    "os"
     "testing"
     "github.com/gruntwork-io/terratest/modules/terraform"
-    "github.com/gruntwork-io/terratest/modules/aws"
     "github.com/stretchr/testify/assert"
 )
 
-func TestS3BucketCreation(t *testing.T) {
+func TestStorageAccountCreation(t *testing.T) {
     t.Parallel()
 
     terraformOptions := terraform.WithDefaultRetryableErrors(t, &terraform.Options{
-        TerraformDir: "../modules/s3",
+        TerraformDir: "../modules/azure-storage-account",
         Vars: map[string]interface{}{
-            "environment": "test",
-            "bucket_name": "my-terratest-bucket-12345",
+            "environment":         "test",
+            "location":            "uksouth",
+            "resource_group_name": "rg-terratest-12345",
+            "org":                 "myco",
         },
     })
 
     defer terraform.Destroy(t, terraformOptions)
     terraform.InitAndApply(t, terraformOptions)
 
-    bucketID := terraform.Output(t, terraformOptions, "bucket_id")
-    assert.NotEmpty(t, bucketID)
+    storageAccountName := terraform.Output(t, terraformOptions, "storage_account_name")
+    assert.NotEmpty(t, storageAccountName)
 
-    // Verify bucket encryption is enabled
-    aws.AssertS3BucketVersioningExists(t, "us-east-1", bucketID)
+    httpsOnly := terraform.Output(t, terraformOptions, "https_only")
+    assert.Equal(t, "true", httpsOnly, "Storage account must enforce HTTPS-only traffic")
 }
 ```
 
@@ -523,7 +728,7 @@ When things go wrong, know how to extract detailed information quickly.
 
 **Why it matters:**
 - Faster incident resolution
-- Understand provider API interactions
+- Understand Azure REST API interactions and error responses
 - Debug cryptic plan/apply errors
 
 ```bash
@@ -531,36 +736,51 @@ When things go wrong, know how to extract detailed information quickly.
 export TF_LOG=DEBUG
 export TF_LOG_PATH=./terraform-debug.log
 
-# Log only the core (not providers)
-export TF_LOG_CORE=INFO
-
-# Log only providers
+# Log only the AzureRM provider (reduces noise)
 export TF_LOG_PROVIDER=TRACE
 
-# Run apply with full debug output
+# Enable Azure SDK HTTP request/response logging
+export AZURE_HTTP_TRACING=true
+
+# Run apply with full debug output saved to file
 TF_LOG=TRACE terraform apply 2>&1 | tee apply-debug.log
 
 # Inspect state
-terraform show                              # Human-readable current state
-terraform state list                        # List all resources in state
-terraform state show aws_instance.web       # Show a specific resource's state
+terraform show                                              # Human-readable current state
+terraform state list                                        # List all resources in state
+terraform state show azurerm_storage_account.logs          # Show a specific resource's state
+terraform state show azurerm_virtual_network.main          # Inspect VNet state
 
-# Refresh state (sync with actual cloud)
+# Refresh state to sync with actual Azure resources
 terraform refresh
 
-# Force unlock a stuck state
+# Force unlock a stuck state (releases Azure Blob lease)
 terraform force-unlock <LOCK_ID>
+
+# Check provider versions in use
+terraform version
+terraform providers
 ```
 
 ```hcl
 # Output useful debug info from your configuration
-output "debug_vpc_id" {
-  value       = module.vpc.vpc_id
-  description = "VPC ID — useful for debugging downstream issues"
+output "debug_vnet_id" {
+  value       = azurerm_virtual_network.main.id
+  description = "VNet resource ID — useful for debugging peering and NSG associations"
+}
+
+output "debug_subscription_id" {
+  value       = data.azurerm_client_config.current.subscription_id
+  description = "Confirms which Azure subscription Terraform is targeting"
+}
+
+output "debug_tenant_id" {
+  value       = data.azurerm_client_config.current.tenant_id
+  description = "Confirms the Azure AD tenant in use"
 }
 ```
 
-> 💡 **Tip:** Never commit files containing `TF_LOG=TRACE` output — they often contain sensitive values.
+> 💡 **Tip:** Never commit files containing `TF_LOG=TRACE` output — they often contain ARM bearer tokens and sensitive resource metadata.
 
 ---
 
@@ -574,14 +794,24 @@ Modules are Terraform's primary unit of reuse and abstraction. Structure your co
 - Version and share modules across teams
 
 ```
-# Recommended module structure
+# Recommended Azure project structure
 modules/
-  s3-private-bucket/
+  azure-storage-account/
     main.tf
     variables.tf
     outputs.tf
     README.md
-  ec2-web-server/
+  azure-linux-vm/
+    main.tf
+    variables.tf
+    outputs.tf
+    README.md
+  azure-key-vault/
+    main.tf
+    variables.tf
+    outputs.tf
+    README.md
+  azure-vnet/
     main.tf
     variables.tf
     outputs.tf
@@ -589,44 +819,71 @@ modules/
 
 environments/
   prod/
-    main.tf       ← calls modules
+    main.tf           ← calls modules
     variables.tf
     terraform.tfvars
     backend.tf
   dev/
     main.tf
+    terraform.tfvars
+    backend.tf
 ```
 
 ```hcl
-# modules/s3-private-bucket/main.tf
-resource "aws_s3_bucket" "this" {
-  bucket = var.bucket_name
-  tags   = var.tags
+# modules/azure-storage-account/main.tf
+resource "azurerm_storage_account" "this" {
+  name                            = var.name
+  resource_group_name             = var.resource_group_name
+  location                        = var.location
+  account_tier                    = var.account_tier
+  account_replication_type        = var.replication_type
+  enable_https_traffic_only       = true
+  min_tls_version                 = "TLS1_2"
+  allow_nested_items_to_be_public = false
+  tags                            = var.tags
 }
 
-resource "aws_s3_bucket_public_access_block" "this" {
-  bucket                  = aws_s3_bucket.this.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
-  bucket = aws_s3_bucket.this.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "aws:kms"
-    }
-  }
+resource "azurerm_storage_account_network_rules" "this" {
+  storage_account_id = azurerm_storage_account.this.id
+  default_action     = "Deny"
+  bypass             = ["AzureServices"]
+  ip_rules           = var.allowed_ip_ranges
 }
 ```
 
 ```hcl
-# modules/s3-private-bucket/variables.tf
-variable "bucket_name" {
-  description = "Name of the S3 bucket"
+# modules/azure-storage-account/variables.tf
+variable "name" {
+  description = "Storage account name (max 24 chars, lowercase alphanumeric only)"
   type        = string
+}
+
+variable "resource_group_name" {
+  description = "Name of the resource group"
+  type        = string
+}
+
+variable "location" {
+  description = "Azure region"
+  type        = string
+}
+
+variable "account_tier" {
+  description = "Storage account tier: Standard or Premium"
+  type        = string
+  default     = "Standard"
+}
+
+variable "replication_type" {
+  description = "Replication type: LRS, GRS, ZRS, GZRS"
+  type        = string
+  default     = "GRS"
+}
+
+variable "allowed_ip_ranges" {
+  description = "List of IP ranges allowed to access the storage account"
+  type        = list(string)
+  default     = []
 }
 
 variable "tags" {
@@ -637,24 +894,34 @@ variable "tags" {
 ```
 
 ```hcl
-# modules/s3-private-bucket/outputs.tf
-output "bucket_id" {
-  description = "The name of the bucket"
-  value       = aws_s3_bucket.this.id
+# modules/azure-storage-account/outputs.tf
+output "id" {
+  description = "Resource ID of the storage account"
+  value       = azurerm_storage_account.this.id
 }
 
-output "bucket_arn" {
-  description = "The ARN of the bucket"
-  value       = aws_s3_bucket.this.arn
+output "name" {
+  description = "Name of the storage account"
+  value       = azurerm_storage_account.this.name
+}
+
+output "primary_blob_endpoint" {
+  description = "Primary blob service endpoint"
+  value       = azurerm_storage_account.this.primary_blob_endpoint
 }
 ```
 
 ```hcl
 # environments/prod/main.tf — consuming the module
-module "app_logs" {
-  source      = "../../modules/s3-private-bucket"
-  bucket_name = "myco-prod-app-logs"
-  tags        = local.common_tags
+module "app_logs_storage" {
+  source = "../../modules/azure-storage-account"
+
+  name                = "stmycoprodapplogsuks"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  replication_type    = "GRS"
+  allowed_ip_ranges   = ["203.0.113.0/24"]
+  tags                = local.common_tags
 }
 ```
 
@@ -671,57 +938,83 @@ Replace repetitive resource blocks with `for_each`, `count`, and conditional exp
 
 ```hcl
 # count — simple numeric repetition
-resource "aws_iam_user" "dev_users" {
-  count = length(var.developer_names)
-  name  = var.developer_names[count.index]
+variable "admin_object_ids" {
+  type    = list(string)
+  default = ["aaaaaaaa-0000-0000-0000-000000000001", "aaaaaaaa-0000-0000-0000-000000000002"]
 }
 
+resource "azurerm_role_assignment" "admins" {
+  count                = length(var.admin_object_ids)
+  scope                = azurerm_resource_group.app.id
+  role_definition_name = "Contributor"
+  principal_id         = var.admin_object_ids[count.index]
+}
+```
+
+```hcl
 # for_each with a set — preferred over count for named resources
-variable "s3_buckets" {
+variable "storage_containers" {
   type    = set(string)
-  default = ["logs", "backups", "artifacts"]
+  default = ["logs", "backups", "artifacts", "reports"]
 }
 
-resource "aws_s3_bucket" "buckets" {
-  for_each = var.s3_buckets
-  bucket   = "myco-prod-${each.key}"
+resource "azurerm_storage_container" "containers" {
+  for_each              = var.storage_containers
+  name                  = each.key
+  storage_account_name  = azurerm_storage_account.main.name
+  container_access_type = "private"
 }
+```
 
+```hcl
 # for_each with a map — richer configuration per item
-variable "ec2_instances" {
+variable "virtual_machines" {
   type = map(object({
-    instance_type = string
-    subnet_id     = string
+    size       = string
+    subnet_key = string
+    os_disk_gb = number
   }))
   default = {
-    web = { instance_type = "t3.small",  subnet_id = "subnet-111" }
-    api = { instance_type = "t3.medium", subnet_id = "subnet-222" }
-    db  = { instance_type = "t3.large",  subnet_id = "subnet-333" }
+    web = { size = "Standard_B2s",    subnet_key = "snet-web",  os_disk_gb = 64  }
+    app = { size = "Standard_D2s_v3", subnet_key = "snet-app",  os_disk_gb = 128 }
+    db  = { size = "Standard_D4s_v3", subnet_key = "snet-data", os_disk_gb = 256 }
   }
 }
 
-resource "aws_instance" "app" {
-  for_each = var.ec2_instances
+resource "azurerm_linux_virtual_machine" "app" {
+  for_each = var.virtual_machines
 
-  ami           = var.ami_id
-  instance_type = each.value.instance_type
-  subnet_id     = each.value.subnet_id
+  name                = "${local.prefix}-vm-${each.key}"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  size                = each.value.size
+  admin_username      = var.admin_username
 
-  tags = { Name = "myco-prod-${each.key}" }
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Premium_LRS"
+    disk_size_gb         = each.value.os_disk_gb
+  }
+
+  tags = merge(local.common_tags, { Role = each.key })
+
+  # ... network interface, image reference, etc.
 }
+```
 
-# Conditional — create a resource only in production
-resource "aws_cloudwatch_metric_alarm" "high_cpu" {
+```hcl
+# Conditional — create diagnostic settings only in production
+resource "azurerm_monitor_diagnostic_setting" "storage" {
   count = var.environment == "prod" ? 1 : 0
 
-  alarm_name          = "high-cpu-utilization"
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = "80"
-  evaluation_periods  = "2"
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = "120"
-  statistic           = "Average"
+  name               = "diag-${local.prefix}-storage"
+  target_resource_id = azurerm_storage_account.main.id
+  storage_account_id = azurerm_storage_account.audit.id
+
+  metric {
+    category = "Transaction"
+    enabled  = true
+  }
 }
 ```
 
@@ -732,55 +1025,63 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
 Terraform has a rich set of built-in functions to transform and manipulate data without external scripting.
 
 **Why it matters:**
-- Keeps logic inside Terraform — no shell scripts
+- Keeps logic inside Terraform — no shell scripts needed
 - Reduces boilerplate through data transformation
 - Makes configurations self-documenting
 
 ```hcl
 locals {
   # String functions
-  env_upper   = upper(var.environment)          # "PROD"
-  bucket_name = lower("MyApp-Logs")             # "myapp-logs"
-  trimmed     = trimspace("  hello  ")          # "hello"
+  env_upper   = upper(var.environment)                        # "PROD"
+  sa_name     = lower("STMyCoAppLogs")                       # "stmycoapplogs"
+  trimmed_org = trimspace("  myco  ")                        # "myco"
+
+  # Enforce Azure storage account 24-char lowercase alphanumeric limit
+  storage_name = substr(
+    replace(lower("st-${var.org}-${var.environment}-logs"), "-", ""),
+    0, 24
+  ) # "stmycoprodlogs"
 
   # Collection functions
-  all_azs     = ["us-east-1a", "us-east-1b", "us-east-1c"]
-  first_two   = slice(local.all_azs, 0, 2)      # first 2 AZs
+  all_locations    = ["uksouth", "ukwest", "westeurope"]
+  primary_location = element(local.all_locations, 0)          # "uksouth"
 
   # Map merging
-  base_tags   = { Env = "prod", Team = "platform" }
-  extra_tags  = { App = "myapp" }
-  all_tags    = merge(local.base_tags, local.extra_tags)
+  base_tags  = { Env = "prod", ManagedBy = "Terraform" }
+  extra_tags = { App = "myapp", Team = "platform" }
+  all_tags   = merge(local.base_tags, local.extra_tags)
 
-  # Encoding
-  user_data_b64 = base64encode(file("${path.module}/scripts/user_data.sh"))
+  # Encoding — base64 encode a cloud-init script for custom_data
+  custom_data_b64 = base64encode(file("${path.module}/scripts/cloud-init.yaml"))
 
-  # Conditionals and lookups
-  instance_size = lookup(var.instance_sizes, var.environment, "t3.micro")
-
-  # Type conversion
-  port_list = tolist([80, 443, 8080])
+  # Lookup with default fallback
+  vm_sku = lookup(var.vm_skus_by_env, var.environment, "Standard_B2s")
 
   # Flatten nested lists
-  all_cidrs = flatten([
-    var.private_cidrs,
-    var.public_cidrs
+  all_subnet_ids = flatten([
+    module.vnet_primary.vnet_subnets,
+    module.vnet_secondary.vnet_subnets,
   ])
 
-  # Format strings
-  log_group = format("/aws/lambda/%s-%s", var.app_name, var.environment)
+  # Format a consistent Log Analytics workspace name
+  law_name = format("law-%s-%s-%s", var.org, var.environment, var.short_location)
+
+  # cidrsubnet — calculate subnet CIDRs dynamically
+  private_subnets = [for i in range(3) : cidrsubnet("10.0.0.0/16", 8, i)]
+  # ["10.0.0.0/24", "10.0.1.0/24", "10.0.2.0/24"]
 }
 
-# cidrsubnet — calculate subnets dynamically
-variable "vpc_cidr" {
+# Use cidrsubnet to avoid hardcoding subnet CIDRs
+variable "vnet_address_space" {
   default = "10.0.0.0/16"
 }
 
-resource "aws_subnet" "private" {
-  count             = 3
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet(var.vpc_cidr, 8, count.index)
-  availability_zone = local.all_azs[count.index]
+resource "azurerm_subnet" "subnets" {
+  count                = 3
+  name                 = "snet-tier-${count.index}"
+  resource_group_name  = azurerm_resource_group.app.name
+  virtual_network_name = azurerm_virtual_network.main.name
+  address_prefixes     = [cidrsubnet(var.vnet_address_space, 8, count.index)]
   # Generates: 10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24
 }
 ```
@@ -792,72 +1093,112 @@ resource "aws_subnet" "private" {
 `dynamic` blocks let you generate repeated nested blocks programmatically, keeping configs concise.
 
 **Why it matters:**
-- Replaces copy-pasted nested blocks
+- Replaces copy-pasted nested blocks (especially NSG rules)
 - Makes rule sets and policies data-driven
 - Cleaner diffs when adding/removing rules
 
 ```hcl
-# Without dynamic — repetitive and hard to maintain
-resource "aws_security_group" "web_bad" {
-  name = "web-sg"
+# Without dynamic — repetitive NSG rules, painful to maintain
+resource "azurerm_network_security_group" "web_bad" {
+  name                = "nsg-web"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
 
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  security_rule {
+    name                       = "allow-http"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
   }
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  security_rule {
+    name                       = "allow-https"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "443"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
   }
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/8"]
-  }
+  # ...repeat for every rule
 }
+```
 
+```hcl
 # ✅ With dynamic — data-driven and scalable
-variable "ingress_rules" {
+variable "nsg_rules" {
   type = list(object({
-    port        = number
-    protocol    = string
-    cidr_blocks = list(string)
-    description = string
+    name                   = string
+    priority               = number
+    direction              = string
+    access                 = string
+    protocol               = string
+    destination_port_range = string
+    source_address_prefix  = string
+    description            = string
   }))
   default = [
-    { port = 80,   protocol = "tcp", cidr_blocks = ["0.0.0.0/0"],  description = "HTTP" },
-    { port = 443,  protocol = "tcp", cidr_blocks = ["0.0.0.0/0"],  description = "HTTPS" },
-    { port = 8080, protocol = "tcp", cidr_blocks = ["10.0.0.0/8"], description = "Internal API" },
+    {
+      name                   = "allow-http"
+      priority               = 100
+      direction              = "Inbound"
+      access                 = "Allow"
+      protocol               = "Tcp"
+      destination_port_range = "80"
+      source_address_prefix  = "*"
+      description            = "Allow HTTP from internet"
+    },
+    {
+      name                   = "allow-https"
+      priority               = 110
+      direction              = "Inbound"
+      access                 = "Allow"
+      protocol               = "Tcp"
+      destination_port_range = "443"
+      source_address_prefix  = "*"
+      description            = "Allow HTTPS from internet"
+    },
+    {
+      name                   = "allow-app-internal"
+      priority               = 200
+      direction              = "Inbound"
+      access                 = "Allow"
+      protocol               = "Tcp"
+      destination_port_range = "8080"
+      source_address_prefix  = "10.0.2.0/24"
+      description            = "Allow internal app tier traffic"
+    },
   ]
 }
 
-resource "aws_security_group" "web" {
-  name        = "${local.prefix}-web-sg"
-  description = "Web tier security group"
-  vpc_id      = module.vpc.vpc_id
+resource "azurerm_network_security_group" "web" {
+  name                = "nsg-${local.prefix}-web"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
 
-  dynamic "ingress" {
-    for_each = var.ingress_rules
+  dynamic "security_rule" {
+    for_each = var.nsg_rules
     content {
-      from_port   = ingress.value.port
-      to_port     = ingress.value.port
-      protocol    = ingress.value.protocol
-      cidr_blocks = ingress.value.cidr_blocks
-      description = ingress.value.description
+      name                       = security_rule.value.name
+      priority                   = security_rule.value.priority
+      direction                  = security_rule.value.direction
+      access                     = security_rule.value.access
+      protocol                   = security_rule.value.protocol
+      source_port_range          = "*"
+      destination_port_range     = security_rule.value.destination_port_range
+      source_address_prefix      = security_rule.value.source_address_prefix
+      destination_address_prefix = "*"
+      description                = security_rule.value.description
     }
   }
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  tags = local.common_tags
 }
 ```
 
@@ -865,7 +1206,7 @@ resource "aws_security_group" "web" {
 
 ## 16. Use Terraform Workspaces
 
-Workspaces allow you to manage multiple environments from a single Terraform configuration with isolated state files.
+Workspaces allow you to manage multiple environments from a single Terraform configuration with isolated state files stored in separate blobs on the same storage account.
 
 **Why it matters:**
 - Single codebase for dev/staging/prod
@@ -877,33 +1218,43 @@ Workspaces allow you to manage multiple environments from a single Terraform con
 locals {
   env = terraform.workspace  # "dev", "staging", "prod"
 
-  instance_type = {
-    dev     = "t3.micro"
-    staging = "t3.small"
-    prod    = "t3.large"
+  vm_sku = {
+    dev     = "Standard_B2s"
+    staging = "Standard_D2s_v3"
+    prod    = "Standard_D4s_v3"
   }
 
-  min_capacity = {
+  min_instances = {
     dev     = 1
     staging = 2
     prod    = 5
   }
+
+  replication = {
+    dev     = "LRS"
+    staging = "ZRS"
+    prod    = "GRS"
+  }
 }
 
-resource "aws_autoscaling_group" "web" {
-  min_size = local.min_capacity[local.env]
-  max_size = local.min_capacity[local.env] * 2
+resource "azurerm_storage_account" "app" {
+  name                     = "st${var.org}${local.env}app"
+  resource_group_name      = azurerm_resource_group.app.name
+  location                 = azurerm_resource_group.app.location
+  account_tier             = "Standard"
+  account_replication_type = local.replication[local.env]
+  tags                     = local.common_tags
+}
 
-  launch_template {
-    id      = aws_launch_template.web.id
-    version = "$Latest"
-  }
+resource "azurerm_linux_virtual_machine_scale_set" "web" {
+  name                = "vmss-${local.prefix}-web"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  sku                 = local.vm_sku[local.env]
+  instances           = local.min_instances[local.env]
+  admin_username      = var.admin_username
 
-  tag {
-    key                 = "Environment"
-    value               = local.env
-    propagate_at_launch = true
-  }
+  # ... other required blocks
 }
 ```
 
@@ -915,10 +1266,10 @@ terraform workspace list                # List all workspaces
 terraform workspace show                # Show current workspace
 
 # Apply to a specific workspace
-terraform workspace select prod && terraform apply
+terraform workspace select prod && terraform apply -var-file="prod.tfvars"
 ```
 
-> ⚠️ **Note:** Workspaces share the same backend bucket — use separate backends (or separate directories) for true isolation in highly regulated environments.
+> ⚠️ **Note:** Workspaces share the same Azure Blob Storage container — state is separated by blob key prefix. Use separate backends or separate Azure subscriptions for strict isolation in regulated environments.
 
 ---
 
@@ -927,56 +1278,97 @@ terraform workspace select prod && terraform apply
 Control how Terraform handles resource creation, updates, and deletion with `lifecycle` meta-arguments.
 
 **Why it matters:**
-- Prevent accidental deletion of critical resources
-- Allow blue/green deployments without downtime
+- Prevent accidental deletion of critical Azure resources
+- Allow zero-downtime replacements
 - Ignore noisy attribute changes managed outside Terraform
 
 ```hcl
 # create_before_destroy — zero-downtime replacement
-resource "aws_instance" "web" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
+resource "azurerm_linux_virtual_machine" "web" {
+  name                = "${local.prefix}-vm-web"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  size                = var.vm_size
+  admin_username      = var.admin_username
 
   lifecycle {
     create_before_destroy = true
   }
-}
 
-# prevent_destroy — protect stateful/critical resources
-resource "aws_db_instance" "main" {
-  identifier     = "prod-postgres"
-  engine         = "postgres"
-  instance_class = "db.r6g.large"
+  # ... other required blocks
+}
+```
+
+```hcl
+# prevent_destroy — protect critical stateful resources from accidental deletion
+resource "azurerm_mssql_server" "main" {
+  name                         = "sql-${local.prefix}"
+  resource_group_name          = azurerm_resource_group.app.name
+  location                     = azurerm_resource_group.app.location
+  version                      = "12.0"
+  administrator_login          = "sqladmin"
+  administrator_login_password = data.azurerm_key_vault_secret.db_password.value
 
   lifecycle {
     prevent_destroy = true
   }
 }
 
+resource "azurerm_key_vault" "main" {
+  name                = "kv-${local.prefix}"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  tenant_id           = data.azurerm_client_config.current.tenant_id
+  sku_name            = "standard"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+```
+
+```hcl
 # ignore_changes — don't overwrite changes made outside Terraform
-resource "aws_instance" "managed_externally" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
+resource "azurerm_kubernetes_cluster" "main" {
+  name                = "aks-${local.prefix}"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  dns_prefix          = "aks-${var.org}-${var.environment}"
+
+  default_node_pool {
+    name       = "default"
+    node_count = 3
+    vm_size    = "Standard_D2s_v3"
+  }
 
   lifecycle {
     ignore_changes = [
-      ami,           # AMI is managed by Packer pipeline
-      user_data,     # User data is managed by config management
-      tags["LastDeployed"],  # Updated by deployment pipeline
+      default_node_pool[0].node_count,  # Managed by AKS Cluster Autoscaler
+      kubernetes_version,               # Upgrades managed by Azure maintenance windows
+      tags["LastUpdated"],              # Updated by deployment pipeline
     ]
   }
-}
 
-# replace_triggered_by — force replacement on dependency change
-resource "aws_instance" "web_v2" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
+  # ... other required blocks
+}
+```
+
+```hcl
+# replace_triggered_by — force VM replacement when a dependent resource changes
+resource "azurerm_linux_virtual_machine" "web_v2" {
+  name                = "${local.prefix}-vm-web"
+  resource_group_name = azurerm_resource_group.app.name
+  location            = azurerm_resource_group.app.location
+  size                = var.vm_size
+  admin_username      = var.admin_username
 
   lifecycle {
     replace_triggered_by = [
-      aws_launch_template.web.latest_version  # Replace when template changes
+      azurerm_network_interface.web  # Replace VM when NIC is recreated
     ]
   }
+
+  # ... other required blocks
 }
 ```
 
@@ -984,10 +1376,10 @@ resource "aws_instance" "web_v2" {
 
 ## 18. Use Variable Validations
 
-Add `validation` blocks to variables to fail fast with clear error messages rather than obscure provider errors.
+Add `validation` blocks to variables to fail fast with clear error messages rather than obscure Azure API errors.
 
 **Why it matters:**
-- Catch invalid inputs before API calls are made
+- Catch invalid inputs before any Azure API calls are made
 - Self-documenting constraints
 - Better developer experience with actionable errors
 
@@ -1002,43 +1394,66 @@ variable "environment" {
   }
 }
 
-variable "instance_type" {
-  description = "EC2 instance type"
+variable "location" {
+  description = "Azure region"
   type        = string
 
   validation {
-    condition     = can(regex("^t3\\.", var.instance_type))
-    error_message = "instance_type must be a t3 family instance (e.g. t3.micro, t3.small)."
+    condition = contains([
+      "uksouth", "ukwest", "westeurope", "northeurope",
+      "eastus", "eastus2", "westus2", "australiaeast"
+    ], var.location)
+    error_message = "location must be a supported Azure region slug (e.g. uksouth, westeurope)."
   }
 }
 
-variable "vpc_cidr" {
-  description = "CIDR block for the VPC"
+variable "storage_account_name" {
+  description = "Azure Storage Account name (max 24 chars, lowercase alphanumeric only)"
   type        = string
 
   validation {
-    condition     = can(cidrhost(var.vpc_cidr, 0))
-    error_message = "vpc_cidr must be a valid CIDR block (e.g. 10.0.0.0/16)."
+    condition     = can(regex("^[a-z0-9]{3,24}$", var.storage_account_name))
+    error_message = "storage_account_name must be 3-24 characters, lowercase letters and numbers only. No hyphens or underscores."
   }
 }
 
-variable "retention_days" {
-  description = "Log retention period in days"
-  type        = number
+variable "vm_size" {
+  description = "Azure VM SKU size"
+  type        = string
 
   validation {
-    condition     = contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365], var.retention_days)
-    error_message = "retention_days must be a valid CloudWatch log retention value."
+    condition     = can(regex("^Standard_", var.vm_size))
+    error_message = "vm_size must be a valid Azure VM SKU starting with 'Standard_' (e.g. Standard_D2s_v3)."
+  }
+}
+
+variable "vnet_address_space" {
+  description = "CIDR block for the Virtual Network"
+  type        = string
+
+  validation {
+    condition     = can(cidrhost(var.vnet_address_space, 0))
+    error_message = "vnet_address_space must be a valid CIDR block (e.g. 10.0.0.0/16)."
+  }
+}
+
+variable "replication_type" {
+  description = "Storage account replication type"
+  type        = string
+
+  validation {
+    condition     = contains(["LRS", "GRS", "RAGRS", "ZRS", "GZRS", "RAGZRS"], var.replication_type)
+    error_message = "replication_type must be one of: LRS, GRS, RAGRS, ZRS, GZRS, RAGZRS."
   }
 }
 
 variable "tags" {
-  description = "Resource tags"
+  description = "Resource tags — must include Team and CostCenter"
   type        = map(string)
 
   validation {
-    condition     = contains(keys(var.tags), "Team")
-    error_message = "tags must include a 'Team' key."
+    condition     = contains(keys(var.tags), "Team") && contains(keys(var.tags), "CostCenter")
+    error_message = "tags must include both 'Team' and 'CostCenter' keys."
   }
 }
 ```
@@ -1047,34 +1462,41 @@ variable "tags" {
 
 ## 19. Leverage Helper Tools
 
-A thriving ecosystem of tools makes Terraform development faster, safer, and more consistent.
+A thriving ecosystem of tools makes Terraform development on Azure faster, safer, and more consistent.
 
 | Tool | Purpose | Install |
 |------|---------|---------|
-| [tflint](https://github.com/terraform-linters/tflint) | Linting & best practice checks | `brew install tflint` |
-| [tfsec](https://github.com/aquasecurity/tfsec) | Security scanning | `brew install tfsec` |
+| [tflint](https://github.com/terraform-linters/tflint) | Linting with Azure-specific rules | `brew install tflint` |
+| [tfsec](https://github.com/aquasecurity/tfsec) | Security scanning (Azure rules built-in) | `brew install tfsec` |
 | [checkov](https://www.checkov.io/) | Security & compliance scanning | `pip install checkov` |
-| [infracost](https://www.infracost.io/) | Cost estimation before apply | `brew install infracost` |
+| [infracost](https://www.infracost.io/) | Azure cost estimation before apply | `brew install infracost` |
+| [aztfexport](https://github.com/Azure/aztfexport) | Export existing Azure resources to Terraform | `brew install aztfexport` |
 | [tfswitch](https://tfswitch.warrensbox.com/) | Terraform version manager | `brew install warrensbox/tap/tfswitch` |
 | [pre-commit](https://pre-commit.com/) | Git hooks for fmt/validate/lint | `brew install pre-commit` |
 | [terragrunt](https://terragrunt.gruntwork.io/) | DRY wrapper for Terraform | `brew install terragrunt` |
 | [atlantis](https://www.runatlantis.io/) | Pull request automation | Helm chart / Docker |
 
 ```bash
-# tflint — catch common mistakes and deprecated syntax
-tflint --init
-tflint --recursive
+# tflint — with Azure ruleset plugin
+cat > .tflint.hcl << 'EOF'
+plugin "azurerm" {
+  enabled = true
+  version = "0.26.0"
+  source  = "github.com/terraform-linters/tflint-ruleset-azurerm"
+}
+EOF
+tflint --init && tflint --recursive
 
-# tfsec — static security analysis
-tfsec .
-tfsec . --soft-fail  # Don't fail on warnings
+# tfsec — Azure-aware security scanning
+tfsec . --include-passed
+tfsec . --soft-fail    # Warn only, don't fail CI
 
-# infracost — see the cost impact of changes in CI
+# infracost — Azure cost breakdown before apply
 infracost breakdown --path .
 infracost diff --path . --compare-to baseline.json
 
-# pre-commit — automate checks on every commit
-# .pre-commit-config.yaml
+# aztfexport — export an entire existing Azure resource group to Terraform
+aztfexport resource-group rg-existing-app
 ```
 
 ```yaml
@@ -1086,6 +1508,8 @@ repos:
       - id: terraform_fmt
       - id: terraform_validate
       - id: terraform_tflint
+        args:
+          - --args=--config=.tflint.hcl
       - id: terraform_tfsec
       - id: infracost_breakdown
         args:
@@ -1109,12 +1533,13 @@ The right editor setup dramatically improves productivity with autocompletion, i
 | Extension | Publisher | What it does |
 |-----------|-----------|-------------|
 | **HashiCorp Terraform** | HashiCorp | Syntax highlighting, autocompletion, hover docs, go-to-definition |
-| **Terraform Lens** | 4ops | Enhanced resource navigation |
+| **Azure Terraform** | Microsoft | Azure-specific Terraform workflows, Cloud Shell integration |
+| **Azure Tools** | Microsoft | Browse and manage Azure resources from the editor |
 | **GitLens** | GitKraken | Inline blame & history for `.tf` files |
 | **Error Lens** | Alexander | Inline error highlighting |
 
 ```json
-// .vscode/settings.json — recommended project settings
+// .vscode/settings.json — recommended project settings for Azure Terraform
 {
   "[terraform]": {
     "editor.defaultFormatter": "hashicorp.terraform",
@@ -1127,55 +1552,98 @@ The right editor setup dramatically improves productivity with autocompletion, i
   },
   "terraform.languageServer.enable": true,
   "terraform.languageServer.args": ["serve"],
-  "terraform.codelens.referenceCount": true
+  "terraform.codelens.referenceCount": true,
+  "azureTerraform.terminal": "integrated",
+  "azureTerraform.cloudShellDirectory": "clouddrive/terraform"
 }
 ```
 
-### JetBrains IDEs (IntelliJ, GoLand, PyCharm)
+### JetBrains IDEs (IntelliJ, GoLand, Rider)
 
-- **HashiCorp Terraform** plugin — available in JetBrains Marketplace
+- **HashiCorp Terraform** plugin — available in the JetBrains Marketplace
+- **Azure Toolkit for IntelliJ** — browse and manage Azure resources inline
 - Provides full language support, variable resolution, and resource navigation
 
 ### Vim / Neovim
 
 ```vim
 " Install via vim-plug or lazy.nvim
-Plug 'hashivim/vim-terraform'         " Syntax + fmt on save
-Plug 'nvim-treesitter/nvim-treesitter' " Better syntax parsing
+Plug 'hashivim/vim-terraform'           " Syntax + fmt on save
+Plug 'nvim-treesitter/nvim-treesitter'  " Better syntax parsing
 
 " .vimrc
 let g:terraform_fmt_on_save = 1
 let g:terraform_align = 1
 ```
 
-### Useful Snippets
-
-Most Terraform extensions support custom snippets. Example for VS Code:
+### Useful Azure-Specific Snippets for VS Code
 
 ```json
 // .vscode/terraform.code-snippets
 {
-  "Terraform Resource": {
-    "prefix": "res",
+  "Azure Resource Group": {
+    "prefix": "azrg",
     "body": [
-      "resource \"${1:type}\" \"${2:name}\" {",
-      "  ${3}",
+      "resource \"azurerm_resource_group\" \"${1:name}\" {",
+      "  name     = \"rg-${2:workload}-${3:env}-${4:location}\"",
+      "  location = var.location",
+      "  tags     = local.common_tags",
       "}",
       ""
     ],
-    "description": "Terraform resource block"
+    "description": "Azure Resource Group"
   },
-  "Terraform Variable": {
-    "prefix": "var",
+  "Azure Storage Account": {
+    "prefix": "azsa",
     "body": [
-      "variable \"${1:name}\" {",
-      "  description = \"${2:description}\"",
-      "  type        = ${3:string}",
-      "  default     = ${4:null}",
+      "resource \"azurerm_storage_account\" \"${1:name}\" {",
+      "  name                            = \"${2:storageaccountname}\"",
+      "  resource_group_name             = azurerm_resource_group.${3:rg}.name",
+      "  location                        = azurerm_resource_group.${3:rg}.location",
+      "  account_tier                    = \"Standard\"",
+      "  account_replication_type        = \"GRS\"",
+      "  enable_https_traffic_only       = true",
+      "  min_tls_version                 = \"TLS1_2\"",
+      "  allow_nested_items_to_be_public = false",
+      "  tags                            = local.common_tags",
       "}",
       ""
     ],
-    "description": "Terraform variable block"
+    "description": "Secure Azure Storage Account"
+  },
+  "AzureRM Provider Block": {
+    "prefix": "azprovider",
+    "body": [
+      "terraform {",
+      "  required_version = \">= 1.6\"",
+      "",
+      "  required_providers {",
+      "    azurerm = {",
+      "      source  = \"hashicorp/azurerm\"",
+      "      version = \"~> 3.0\"",
+      "    }",
+      "  }",
+      "}",
+      "",
+      "provider \"azurerm\" {",
+      "  features {}",
+      "}",
+      ""
+    ],
+    "description": "Terraform AzureRM provider block"
+  },
+  "Azure Backend Config": {
+    "prefix": "azbackend",
+    "body": [
+      "backend \"azurerm\" {",
+      "  resource_group_name  = \"${1:rg-terraform-state}\"",
+      "  storage_account_name = \"${2:stmycomptfstate}\"",
+      "  container_name       = \"tfstate\"",
+      "  key                  = \"${3:prod/component/terraform.tfstate}\"",
+      "}",
+      ""
+    ],
+    "description": "Azure Blob Storage backend config"
   }
 }
 ```
@@ -1185,18 +1653,32 @@ Most Terraform extensions support custom snippets. Example for VS Code:
 ## Quick Reference Cheatsheet
 
 ```bash
-# Initialise                    terraform init
-# Format                        terraform fmt -recursive
-# Validate                      terraform validate
-# Plan                          terraform plan -out=tfplan
-# Apply                         terraform apply tfplan
-# Destroy                       terraform destroy
-# Show state                    terraform show
-# List resources                terraform state list
-# Import resource               terraform import <address> <id>
-# Taint resource (force replace) terraform taint <resource>
-# Workspace                     terraform workspace select <name>
-# Debug                         TF_LOG=DEBUG terraform apply
+# Initialise                      terraform init
+# Format                          terraform fmt -recursive
+# Validate                        terraform validate
+# Plan                            terraform plan -out=tfplan
+# Apply                           terraform apply tfplan
+# Destroy                         terraform destroy
+# Show state                      terraform show
+# List resources                  terraform state list
+# Import resource                 terraform import <address> <azure-resource-id>
+# Refresh state                   terraform refresh
+# Workspace                       terraform workspace select <name>
+# Debug                           TF_LOG=DEBUG terraform apply
+# Azure auth check                az account show
+# Export existing Azure infra     aztfexport resource-group <rg-name>
+```
+
+### Azure Resource ID Format (for `terraform import`)
+
+```
+/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/{provider}/{resourceType}/{resourceName}
+
+# Examples:
+/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-myco-prod-uks-app
+/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-myco-prod-uks-app/providers/Microsoft.Storage/storageAccounts/stmycoprodlogs
+/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-myco-prod-uks-app/providers/Microsoft.Network/virtualNetworks/vnet-myco-prod-uks
+/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-myco-prod-uks-app/providers/Microsoft.KeyVault/vaults/kv-myco-prod-uks
 ```
 
 ---
@@ -1205,10 +1687,11 @@ Most Terraform extensions support custom snippets. Example for VS Code:
 
 Found an issue or want to add a new best practice? Open a PR! Please include:
 - A clear explanation of the practice
-- A working Terraform code example
+- A working Terraform + Azure example
 - Notes on when to apply (and when not to)
 
 ---
-COURTESY : https://www.terraform-best-practices.com/
-
-*Maintained with ❤️ — PRs welcome*
+Courtesy URLs
+https://www.terraform-best-practices.com/
+https://developer.hashicorp.com/terraform/cloud-docs/recommended-practices
+---
